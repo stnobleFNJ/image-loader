@@ -11,7 +11,8 @@ NAS의 이미지를 읽어 썸네일을 `NAS_IMG`에 BLOB으로 넣습니다.
 - `NAS_IMG.bs_id`는 사업명으로 찾은 지금 쓰는(`Y`) `NAS_BS.bs_id`입니다. `bs_year`는 숫자이고 엑셀의 "연도미상"은 NULL,
   `file_ext`는 파일명에서 뽑은 확장자(소문자)입니다.
 - 썸네일: 긴 변 320px JPEG(품질 80), 실측 평균 13~17KB. `thumb`(MEDIUMBLOB), `thumb_w`·`thumb_h`,
-  원본 해상도 `img_w`·`img_h`. 읽지 못한 파일은 `thumb_error`에 이유가 남고 다시 시도하지 않습니다.
+  원본 해상도 `img_w`·`img_h`. 끝이 조금 잘린 JPEG도 읽습니다.
+  그래도 썸네일을 만들지 못한 줄(파일 없음·깨진 파일)은 `db_state='D'`가 되고, 이유는 `thumb_error`에 남습니다.
 - `db_state`: 지금 쓰는 줄은 `Y`, 지난 실행에서 넣은 줄은 `D`. `load_id`는 실행마다 1씩 늘어나는 번호입니다.
 
 ## 준비
@@ -34,6 +35,7 @@ python image_loader.py --only bs              # 사업별 요약만
 python image_loader.py --no-thumb             # 썸네일 없이 목록만
 python image_loader.py --thumb-size 480       # 썸네일 크기 바꾸기 (이미 만든 것은 그대로)
 python image_loader.py --table-suffix _TEST   # NAS_BS_TEST, NAS_IMG_TEST 에 시험 저장
+python image_loader.py --retry-thumbs         # 썸네일 없는 Y 줄만 다시 만들기 (엑셀·load_id·상태 그대로)
 
 python view_thumbs.py                         # 저장된 썸네일을 HTML 로 만들어 브라우저로 보기
 python view_thumbs.py --limit 200 --bs 디지털새싹

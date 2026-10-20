@@ -325,6 +325,57 @@ THUMB_COLS = ["img_w", "img_h", "thumb", "thumb_w", "thumb_h", "thumb_at", "thum
 NO_THUMB = (None,) * len(THUMB_COLS)
 
 
+def setup_pillow():
+    try:
+        from PIL import Image, ImageFile
+        import pillow_heif
+        pillow_heif.register_heif_opener()               # 아이폰 HEIC
+    except ImportError:
+        sys.exit("Pillow / pillow-heif 가 없습니다.  pip install -r requirements.txt  로 설치하세요.")
+    Image.MAX_IMAGE_PIXELS = 400_000_000
+    ImageFile.LOAD_TRUNCATED_IMAGES = True               # 끝이 몇십 바이트 잘린 JPEG(카카오톡 등)도 읽음
+
+
+def retry_thumbs(conn, table, size, workers):
+    """db_state='Y' 인데 썸네일이 없는 줄만 NAS 에서 다시 읽어 채운다 (load_id 그대로).
+    그래도 만들지 못한 줄은 D 로 바꾼다."""
+    setup_pillow()
+    cur = conn.cursor()
+    cur.execute(f"SELECT img_id, folder_path, file_name FROM {table} WHERE db_state='Y' AND thumb IS NULL")
+    todo = cur.fetchall()
+    print(f"  썸네일 없는 Y 줄: {len(todo):,}")
+
+    def job(row):
+        try:
+            return row[0], make_thumb(os.path.join(row[1], row[2]), size), None
+        except Exception as e:
+            return row[0], None, f"{type(e).__name__}: {e}"[:200]
+
+    ok_sql = (f"UPDATE {table} SET thumb=%s, thumb_w=%s, thumb_h=%s, img_w=%s, img_h=%s,"
+              f" thumb_at=NOW(), thumb_error=NULL WHERE img_id=%s")
+    err_sql = f"UPDATE {table} SET thumb_error=%s, thumb_at=NOW(), db_state='D' WHERE img_id=%s"
+    made = failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i in range(0, len(todo), THUMB_BATCH):
+            oks, errs = [], []
+            for img_id, res, err in pool.map(job, todo[i:i + THUMB_BATCH]):
+                if res:
+                    oks.append(res + (img_id,))
+                else:
+                    errs.append((err, img_id))
+            if oks:
+                cur.executemany(ok_sql, oks)
+            if errs:
+                cur.executemany(err_sql, errs)
+            conn.commit()
+            made += len(oks)
+            failed += len(errs)
+            print(f"\r  썸네일 다시 만들기 {made + failed:,}/{len(todo):,}", end="", flush=True)
+    if todo:
+        print()
+    print(f"  썸네일: 새로 만듦 {made:,} / 여전히 실패 {failed:,}" + (" (D 로 바꿈)" if failed else ""))
+
+
 class Thumbnailer:
     """NAS_IMG 에 넣을 한 묶음의 줄마다 THUMB_COLS 값을 만든다.
     지난 실행(D 줄)에 같은 파일(경로·크기·수정일)의 썸네일이 있으면 그것을 쓰고,
@@ -332,13 +383,7 @@ class Thumbnailer:
 
     def __init__(self, conn, table, load_id, size, workers, make_new=True):
         if make_new:
-            try:
-                from PIL import Image
-                import pillow_heif
-                pillow_heif.register_heif_opener()       # 아이폰 HEIC
-            except ImportError:
-                sys.exit("Pillow / pillow-heif 가 없습니다.  pip install -r requirements.txt  로 설치하세요.")
-            Image.MAX_IMAGE_PIXELS = 400_000_000
+            setup_pillow()
         self.cur = conn.cursor()
         self.table, self.load_id, self.size, self.make_new = table, load_id, size, make_new
         self.pool = ThreadPoolExecutor(max_workers=workers)
@@ -380,10 +425,15 @@ class Thumbnailer:
         # 새 줄로 옮겨 간 썸네일은 D 줄에서 비워 DB 용량이 실행마다 늘지 않게 한다.
         self.cur.execute(f"UPDATE {self.table} SET thumb=NULL WHERE load_id < %s AND thumb IS NOT NULL",
                          (self.load_id,))
+        # 썸네일을 만들지 못한 줄(파일 없음·깨진 파일)은 쓰지 않는 줄로 본다.
+        if self.make_new:
+            self.cur.execute(f"UPDATE {self.table} SET db_state='D' WHERE load_id=%s AND thumb IS NULL"
+                             f" AND thumb_error IS NOT NULL", (self.load_id,))
         conn.commit()
         avg = self.bytes / self.made / 1024 if self.made else 0
         print(f"  썸네일: 새로 만듦 {self.made:,} (평균 {avg:.1f}KB) / 지난 것 씀 {self.reused:,}"
-              f" / 실패 {self.failed:,}" + ("  — 실패 이유는 thumb_error 열에 있습니다." if self.failed else ""))
+              f" / 실패 {self.failed:,}"
+              + ("  — 실패한 줄은 D 로 두었고, 이유는 thumb_error 열에 있습니다." if self.failed else ""))
 
 
 def main():
@@ -397,6 +447,8 @@ def main():
     ap.add_argument("--no-thumb", action="store_true", help="썸네일을 만들지 않음")
     ap.add_argument("--thumb-size", type=int, default=THUMB_SIZE, help=f"썸네일 긴 변 px (기본 {THUMB_SIZE})")
     ap.add_argument("--workers", type=int, default=8, help="썸네일을 동시에 읽는 개수 (기본 8)")
+    ap.add_argument("--retry-thumbs", action="store_true",
+                    help="엑셀은 읽지 않고, 썸네일이 없는 Y 줄만 다시 만듦 (load_id·상태 그대로)")
     ap.add_argument("--table-suffix", default="", help="테이블 이름 뒤에 붙일 말 (예: _TEST → NAS_BS_TEST)")
     args = ap.parse_args()
 
@@ -410,6 +462,15 @@ def main():
     bs_table = "NAS_BS" + args.table_suffix
     img_table = "NAS_IMG" + args.table_suffix
     started = time.time()
+
+    if args.retry_thumbs:
+        conn = connect(load_config(args.config))
+        try:
+            retry_thumbs(conn, img_table, args.thumb_size, args.workers)
+        finally:
+            conn.close()
+        print(f"걸린 시간 : {time.time() - started:,.0f}초")
+        return
 
     print(f"엑셀 파일 : {args.xlsx}")
     wb = openpyxl.load_workbook(args.xlsx, read_only=True, data_only=True)
